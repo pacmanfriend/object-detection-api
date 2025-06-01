@@ -673,28 +673,14 @@ class Linear(Layer):
         batch_size = x.shape[0]
         x_flat = x.reshape(batch_size, -1)
 
-        # Используем cuBLAS для эффективного матричного умножения
-        # from pycuda import cublas
-        from pycuda import cuda
-        handle = cuda.cublas.cublasCreate()
-
         output = gpuarray.zeros((batch_size, self.out_features), dtype=np.float32)
 
-        alpha = np.float32(1.0)
-        beta = np.float32(0.0)
+        # Простое матричное умножение без cuBLAS для стабильности
+        # output = x_flat @ weight.T + bias
+        weight_t = self.params['weight'].reshape(self.out_features, self.in_features).T
 
-        cuda.cublas.cublasSgemm(
-            handle, 'n', 't',
-            self.out_features, batch_size, self.in_features,
-            alpha, self.params['weight'].gpudata, self.out_features,
-            x_flat.gpudata, self.in_features,
-            beta, output.gpudata, self.out_features
-        )
-
-        # Добавляем bias
-        output += self.params['bias']
-
-        cuda.cublas.cublasDestroy(handle)
+        for i in range(batch_size):
+            output[i] = gpuarray.dot(x_flat[i], weight_t) + self.params['bias']
 
         return output
 
@@ -703,21 +689,9 @@ class Linear(Layer):
         batch_size = x.shape[0]
         x_flat = x.reshape(batch_size, -1)
 
-        # from pycuda import cublas
-        from pycuda import cuda
-        handle = cuda.cublas.cublasCreate()
-
-        alpha = np.float32(1.0)
-        beta = np.float32(0.0)
-
-        # Градиент по весам: grad_w = grad_output.T @ x
-        cuda.cublas.cublasSgemm(
-            handle, 'n', 'n',
-            self.in_features, self.out_features, batch_size,
-            alpha, x_flat.gpudata, self.in_features,
-            grad_output.gpudata, self.out_features,
-            beta, self.grads['weight'].gpudata, self.in_features
-        )
+        # Градиент по весам: grad_w = x.T @ grad_output
+        for i in range(batch_size):
+            self.grads['weight'] += gpuarray.outer(grad_output[i], x_flat[i])
 
         # Градиент по bias
         self.grads['bias'] = gpuarray.sum(grad_output, axis=0)
@@ -725,15 +699,8 @@ class Linear(Layer):
         # Градиент по входу: grad_x = grad_output @ weight
         grad_input_flat = gpuarray.zeros((batch_size, self.in_features), dtype=np.float32)
 
-        cuda.cublas.cublasSgemm(
-            handle, 't', 'n',
-            self.in_features, batch_size, self.out_features,
-            alpha, self.params['weight'].gpudata, self.in_features,
-            grad_output.gpudata, self.out_features,
-            beta, grad_input_flat.gpudata, self.in_features
-        )
-
-        cuda.cublas.cublasDestroy(handle)
+        for i in range(batch_size):
+            grad_input_flat[i] = gpuarray.dot(grad_output[i], self.params['weight'])
 
         # Восстанавливаем форму
         grad_input = grad_input_flat.reshape(x.shape)
@@ -747,8 +714,13 @@ class GlobalAvgPool2d(Layer):
         batch_size, channels, height, width = x.shape
         spatial_size = height * width
 
+        # Reshape и усреднение
         x_reshaped = x.reshape(batch_size, channels, spatial_size)
-        output = gpuarray.sum(x_reshaped, axis=2) / spatial_size
+        output = gpuarray.zeros((batch_size, channels), dtype=np.float32)
+
+        for b in range(batch_size):
+            for c in range(channels):
+                output[b, c] = gpuarray.sum(x_reshaped[b, c]) / spatial_size
 
         return output
 
@@ -758,9 +730,13 @@ class GlobalAvgPool2d(Layer):
         spatial_size = height * width
 
         # Распределяем градиент равномерно
-        grad_output_expanded = grad_output.reshape(batch_size, channels, 1)
-        grad_input = gpuarray.zeros(input_shape, dtype=np.float32)
-        grad_input[:] = grad_output_expanded / spatial_size
+        grad_output_expanded = grad_output.reshape(batch_size, channels, 1, 1)
+        grad_input = gpuarray.empty(input_shape, dtype=np.float32)
+
+        # Используем broadcasting
+        for b in range(batch_size):
+            for c in range(channels):
+                grad_input[b, c, :, :] = grad_output[b, c] / spatial_size
 
         return grad_input
 
@@ -787,16 +763,18 @@ class SGD(Optimizer):
 
         # Инициализация моментов
         self.velocities = []
-        for param_dict in params:
+        for layer in params:
             vel_dict = {}
-            for name, param in param_dict.items():
+            for name, param in layer.get_params().items():
                 vel_dict[name] = gpuarray.zeros_like(param)
             self.velocities.append(vel_dict)
 
     def step(self):
-        for param_dict, grad_dict, vel_dict in zip(self.params,
-                                                   [layer.get_grads() for layer in self.params],
-                                                   self.velocities):
+        for layer in self.params:
+            param_dict = layer.get_params()
+            grad_dict = layer.get_grads()
+            vel_dict = self.velocities[self.params.index(layer)]
+
             for name in param_dict:
                 param = param_dict[name]
                 grad = grad_dict[name]
@@ -825,10 +803,10 @@ class Adam(Optimizer):
         # Инициализация моментов
         self.m = []
         self.v = []
-        for param_dict in params:
+        for layer in params:
             m_dict = {}
             v_dict = {}
-            for name, param in param_dict.items():
+            for name, param in layer.get_params().items():
                 m_dict[name] = gpuarray.zeros_like(param)
                 v_dict[name] = gpuarray.zeros_like(param)
             self.m.append(m_dict)
@@ -837,12 +815,12 @@ class Adam(Optimizer):
     def step(self):
         self.t += 1
 
-        for param_dict, grad_dict, m_dict, v_dict in zip(
-                self.params,
-                [layer.get_grads() for layer in self.params],
-                self.m,
-                self.v
-        ):
+        for i, layer in enumerate(self.params):
+            param_dict = layer.get_params()
+            grad_dict = layer.get_grads()
+            m_dict = self.m[i]
+            v_dict = self.v[i]
+
             for name in param_dict:
                 param = param_dict[name]
                 grad = grad_dict[name]
