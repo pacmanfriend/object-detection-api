@@ -5,3 +5,4 @@ torchaudio~=2.7.0+cu128
 pycuda~=2025.1
 numpy~=2.1.2
 pillow~=11.0.0
+opencv-python
