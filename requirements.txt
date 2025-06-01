@@ -2,5 +2,6 @@ fastapi
 torch~=2.7.0+cu128
 torchvision~=0.22.0+cu128
 torchaudio~=2.7.0+cu128
-pycuda
-numpy
+pycuda~=2025.1
+numpy~=2.1.2
+pillow~=11.0.0
